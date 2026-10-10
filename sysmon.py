@@ -26,15 +26,15 @@ HOME = os.path.expanduser("~")
 
 # Initial content of watched_folders.json (next to this script); the list is edited in the UI
 DEFAULT_WATCHED = [
-    "/private/tmp", "$TMPDIR", "/private/var/folders", "/private/var/log", "/Library/Logs", "/Library/Caches",
+    "/private/tmp", "/private/var/folders", "/private/var/log", "/Library/Logs", "/Library/Caches",
     "~/Library/Logs", "~/Library/Caches", "~/.cache", "~/.npm/_cacache", "~/.yarn/berry/cache",
-    "~/Library/Caches/Yarn", "~/Library/pnpm/store", "~/.local/share/pnpm/store", "~/.cargo/registry/cache",
-    "~/.cargo/registry/src", "~/.gradle/caches", "~/.m2/repository", "~/Library/Caches/Homebrew",
-    "~/Library/Caches/CocoaPods", "~/Library/Caches/org.swift.swiftpm", "~/Library/Developer/Xcode/DerivedData",
+    "~/Library/pnpm/store", "~/.local/share/pnpm/store", "~/.cargo/registry/cache", "~/.cargo/registry/src",
+    "~/.gradle/caches", "~/.m2/repository", "~/Library/Developer/Xcode/DerivedData",
     "~/Library/Developer/CoreSimulator/Caches",
 ]
 WATCHED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watched_folders.json")
-FOLDER_SCAN_INTERVAL = 300.0
+DEFAULT_FOLDER_SCAN_INTERVAL = 300
+FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
 FOLDER_WARN_BYTES = 5 * 1024**3
 
 FILEOPS_ROOTS = ["/"]
@@ -577,24 +577,38 @@ def _expand(entry):
 def _save_watched(entries):
     tmp = WATCHED_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2)
+        json.dump({"folders": entries, "scan_interval_seconds": FOLDER_SCAN_INTERVAL}, f, indent=2)
     os.replace(tmp, WATCHED_FILE)
+
+
+def _load_watched_locked():
+    global FOLDER_SCAN_INTERVAL
+    try:
+        with open(WATCHED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
+        _save_watched(DEFAULT_WATCHED)
+        return list(DEFAULT_WATCHED)
+    except (OSError, ValueError):
+        return list(DEFAULT_WATCHED)
+
+    if isinstance(data, list) and all(isinstance(entry, str) for entry in data):
+        FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
+        return data
+    if isinstance(data, dict):
+        entries = data.get("folders")
+        interval = data.get("scan_interval_seconds", DEFAULT_FOLDER_SCAN_INTERVAL)
+        if isinstance(entries, list) and all(isinstance(entry, str) for entry in entries):
+            FOLDER_SCAN_INTERVAL = (interval if type(interval) is int and 60 <= interval <= 60 * 86400
+                                    else DEFAULT_FOLDER_SCAN_INTERVAL)
+            return entries
+    return list(DEFAULT_WATCHED)
 
 
 def load_watched():
     with FOLDERS_LOCK:
-        try:
-            with open(WATCHED_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            _save_watched(DEFAULT_WATCHED)
-            return list(DEFAULT_WATCHED)
-        except (OSError, ValueError):
-            # broken file: fall back to defaults without overwriting the user's edits
-            return list(DEFAULT_WATCHED)
-    if isinstance(data, list) and all(isinstance(e, str) for e in data):
-        return data
-    return list(DEFAULT_WATCHED)
+        return _load_watched_locked()
 
 
 def edit_watched(action, entry):
@@ -1281,6 +1295,15 @@ HTML = """<!doctype html>
             <button class="btn" data-export="folders" title="Export CSV to ~/Downloads">⤓</button>
         </div>
         <div class="sec-body">
+            <div class="tools folder-settings">
+                <span class="dim">Rescan every</span>
+                <select id="scan-interval-value" aria-label="Scan interval value"></select>
+                <select id="scan-interval-unit" aria-label="Scan interval unit">
+                    <option value="minutes">minutes</option>
+                    <option value="hours">hours</option>
+                    <option value="days">days</option>
+                </select>
+            </div>
             <div class="tools" id="folders-add" style="display: none">
                 <input id="folders-add-input" placeholder="Add folder, e.g. ~/Library/Caches/pip">
                 <button class="btn" id="folders-add-btn" title="Add">+</button>
@@ -1926,6 +1949,36 @@ HTML = """<!doctype html>
 
     // --- watched folders ---------------------------------------------------------------
     let editing = false, lastFolders = [];
+    const scanValue = $('scan-interval-value'), scanUnit = $('scan-interval-unit');
+    for (let value = 1; value <= 60; value++) {
+        const option = el('option', '', value);
+        option.value = value;
+        scanValue.append(option);
+    }
+    scanValue.value = '5';
+    scanUnit.value = 'minutes';
+    async function saveScanInterval() {
+        try {
+            const result = await postJSON('/api/folder-scan-interval', {
+                value: Number(scanValue.value), unit: scanUnit.value,
+            });
+            if (result.error) toast(result.error);
+            else toast('Folder scan interval updated');
+        } catch (e) { toast('Could not update scan interval'); }
+    }
+    scanValue.addEventListener('change', saveScanInterval);
+    scanUnit.addEventListener('change', saveScanInterval);
+    function updateScanInterval(seconds) {
+        const units = [
+            { name: 'days', seconds: 86400 },
+            { name: 'hours', seconds: 3600 },
+            { name: 'minutes', seconds: 60 },
+        ];
+        const unit = units.find(option => seconds % option.seconds === 0 && seconds / option.seconds <= 60);
+        if (!unit) return;
+        scanValue.value = String(seconds / unit.seconds);
+        scanUnit.value = unit.name;
+    }
     async function folderAction(action, entry) {
         let r;
         try { r = await postJSON('/api/folders', { action, entry }); } catch (e) { toast('Error'); return; }
@@ -1959,6 +2012,7 @@ HTML = """<!doctype html>
     function renderFolders(d) {
         if (!d.folders) return;
         lastFolders = d.folders;
+            updateScanInterval(d.folder_scan_interval_seconds);
         $('folders-sum').textContent = 'Σ ' + fmtBytes(d.folders_total) + (d.folders_scanning ? ' · scanning…' : '');
         if (hasSelectionIn($('folders'))) return;
         const nodes = d.folders.map(f => {
@@ -2096,6 +2150,8 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
                 stats = dict(STATE)
             stats["folder_warn"] = FOLDER_WARN_BYTES
             stats["interfaces"] = network_ifaces()
+            with FOLDERS_LOCK:
+                stats["folder_scan_interval_seconds"] = FOLDER_SCAN_INTERVAL
             self._json(stats)
         elif url.path == "/api/fileops":
             ops = {o for o in arg("ops", ",".join(DEFAULT_OPS)).split(",") if o in FILEOP_TYPES}
@@ -2126,6 +2182,7 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             self._send(HTML, "text/html; charset=utf-8")
 
     def do_POST(self):
+        global FOLDER_SCAN_INTERVAL
         if not self._host_ok():
             return
         # Custom header forces a CORS preflight (never answered), so other websites cannot POST here
@@ -2143,7 +2200,19 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
         path = urlparse(self.path).path
-        if path == "/api/interface":
+        if path == "/api/folder-scan-interval":
+            value, unit = body.get("value"), body.get("unit")
+            unit_seconds = {"minutes": 60, "hours": 3600, "days": 86400}
+            if type(value) is not int or not 1 <= value <= 60 or not isinstance(unit, str) or unit not in unit_seconds:
+                self._json({"error": "Invalid folder scan interval"}, 400)
+                return
+            with FOLDERS_LOCK:
+                entries = _load_watched_locked()
+                FOLDER_SCAN_INTERVAL = value * unit_seconds[unit]
+                _save_watched(entries)
+            RESCAN.set()
+            self._json({"ok": True, "interval_seconds": FOLDER_SCAN_INTERVAL})
+        elif path == "/api/interface":
             iface = body.get("iface", "")
             if not isinstance(iface, str) or (iface and iface not in network_ifaces()):
                 self._json({"error": "Invalid network interface"}, 400)

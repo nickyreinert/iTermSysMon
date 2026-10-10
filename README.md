@@ -8,7 +8,8 @@ A lightweight macOS system monitor that runs as an iTerm2 web panel.
 
 - CPU, memory, GPU, network, ports, and file activity
 - Process and application usage
-- Configurable disk usage monitoring for temporary, cache, and build folders
+- Configurable disk usage monitoring and scan interval for temporary, cache, and build folders
+Edit `watched_folders.json` or add and remove folders in the panel. Set the scan interval in the panel (1–60 minutes, hours, or days). The defaults avoid scanning nested cache paths twice. The monitor reports folder sizes; it never deletes files. Folders over 5 GB are highlighted.
 - CSV export
 
 ## Install
