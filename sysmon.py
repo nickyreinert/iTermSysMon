@@ -409,6 +409,13 @@ def default_iface():
     return m.group(1) if m else "en0"
 
 
+def network_ifaces():
+    try:
+        return [name for _, name in socket.if_nameindex()]
+    except OSError:
+        return []
+
+
 def read_iface_bytes(iface):
     for line in _sh(["netstat", "-ibn", "-I", iface]).splitlines()[1:]:
         cols = line.split()
@@ -933,6 +940,7 @@ def sampler():
     types = core_types(len(prev_ticks))
     iface = default_iface()
     iface_checked = time.monotonic()
+    last_override = None
     prev_iface = read_iface_bytes(iface)
     # Remembers counters of vanished processes too, so a reappearing pid isn't double-counted
     net_seen, net_primed, last_seq, last_net_t, top_net = {}, False, 0, 0.0, []
@@ -981,12 +989,21 @@ def sampler():
             APPS = read_apps()
         prev_procs = procs
 
-        if now - iface_checked > 30:
+        with STATE_LOCK:
+            selected_iface = STATE.get("iface_selected")
+        if selected_iface != last_override:
+            last_override = selected_iface
+            iface_checked = 0
+        if selected_iface:
+            new_iface = selected_iface
+        elif now - iface_checked > 30:
             iface_checked = now
             new_iface = default_iface()
-            if new_iface != iface:
-                iface = new_iface
-                prev_iface = read_iface_bytes(iface)
+        else:
+            new_iface = iface
+        if new_iface != iface:
+            iface = new_iface
+            prev_iface = read_iface_bytes(iface)
         rx, tx = read_iface_bytes(iface)
         seq, snap, snap_t = nettop_snapshot()
         if seq != last_seq:
@@ -1056,6 +1073,8 @@ HTML = """<!doctype html>
                 background: #1e1e1e; }
     .sec-head .arrow { width: 10px; color: #888; flex: 0 0 auto; }
     .sec-head .title { font-weight: bold; color: #fff; white-space: nowrap; }
+    .sec-head .net-iface { flex: 0 0 auto; max-width: 110px; padding: 0 2px; border: 1px solid #555; border-radius: 3px;
+                           background: #2b2b2b; color: #8be9fd; font-size: 10px; }
     .sec-head .sum { flex: 1; min-width: 0; text-align: right; color: #50fa7b; white-space: nowrap; overflow: hidden;
                      text-overflow: ellipsis; padding-right: 3px; }
     .sec-head .btn { flex: 0 0 auto; }
@@ -1068,10 +1087,14 @@ HTML = """<!doctype html>
     .bar-fill { background: #50fa7b; height: 100%; width: 0%; transition: width 0.3s; }
     .bar-fill.warn { background: #f1fa8c; }
     .bar-fill.crit { background: #ff5555; }
+    .folder .bar-fill { background: #8be9fd; }
+    .folder .bar-fill.warn { background: #bd93f9; }
+    .folder .bar-fill.crit { background: #ff79c6; }
     .pop { display: none; position: absolute; left: 10px; width: 65%; max-width: 260px; top: 100%; z-index: 10; margin-top: 2px;
            background: #2b2b2b; border: 1px solid #555; border-radius: 4px; padding: 6px; font-weight: normal;
            box-shadow: 0 4px 12px rgba(0,0,0,.6); pointer-events: none; }
     .metric:hover > .pop, .sec-head:hover > .pop { display: block; }
+    .sec-head:hover { z-index: 40; }
     .row { display: flex; justify-content: space-between; align-items: center; gap: 6px; white-space: nowrap; line-height: 1.5; }
     .row .name { overflow: hidden; text-overflow: ellipsis; }
     .row .num { color: #8be9fd; margin-left: auto; }
@@ -1187,7 +1210,11 @@ HTML = """<!doctype html>
 
     <div class="sec" id="sec-net">
         <div class="sec-head">
-            <span class="arrow">▸</span><span class="title" id="net-label">Network</span><span class="sum" id="net-sum">–</span>
+            <span class="arrow">▸</span><span class="title">Network</span>
+            <select class="net-iface" id="net-iface" aria-label="Network interface" title="Select network interface">
+                <option value="">Default</option>
+            </select>
+            <span class="sum" id="net-sum">–</span>
             <button class="btn" data-export="net" title="Export CSV to ~/Downloads">⤓</button>
             <button class="btn" data-pause="net" title="Pause">⏸</button>
             <div class="pop" id="net-pop"></div>
@@ -1374,7 +1401,7 @@ HTML = """<!doctype html>
     for (const sec of document.querySelectorAll('.sec')) {
         const key = sec.id.slice(4);
         sec.querySelector('.sec-head').addEventListener('click', ev => {
-            if (!ev.target.closest('button')) setOpen(key, !isOpen(key));
+            if (!ev.target.closest('button, select')) setOpen(key, !isOpen(key));
         });
     }
     function setPaused(key, value) {
@@ -1642,6 +1669,13 @@ HTML = """<!doctype html>
         }
     }
     const netOpen = new Map();
+    let netIfaceOptions = '';
+    $('net-iface').addEventListener('change', async () => {
+        try {
+            const result = await postJSON('/api/interface', { iface: $('net-iface').value });
+            if (result.error) toast(result.error);
+        } catch (e) { toast('Could not change network interface'); }
+    });
     async function netRefresh(force) {
         if (!isOpen('net') || (paused.net && !force)) return;
         try {
@@ -1720,6 +1754,23 @@ HTML = """<!doctype html>
         exportRows: () => ({ header: ['Process', 'Downloaded bytes', 'Uploaded bytes'],
                              rows: netRows().map(r => [r.name, r.rx, r.tx]) }),
     };
+
+    function updateNetInterfaces(data) {
+        const select = $('net-iface');
+        const optionsKey = JSON.stringify([data.interfaces, data.net.iface]);
+        if (optionsKey !== netIfaceOptions) {
+            netIfaceOptions = optionsKey;
+            const options = [el('option', '', `Default (${data.net.iface})`)];
+            options[0].value = '';
+            for (const iface of data.interfaces) {
+                const option = el('option', '', iface);
+                option.value = iface;
+                options.push(option);
+            }
+            select.replaceChildren(...options);
+        }
+        select.value = data.iface_selected || '';
+    }
 
     // --- ports -----------------------------------------------------------------------
     const ports = { data: null, open: new Map(), seq: 0 };
@@ -1986,7 +2037,7 @@ HTML = """<!doctype html>
         }
         if (d.net && !paused.net) {
             const n = d.net;
-            $('net-label').textContent = 'Network (' + n.iface + ')';
+            updateNetInterfaces(d);
             $('net-sum').textContent = '↓ ' + fmtRate(n.rx_rate) + ' ↑ ' + fmtRate(n.tx_rate) + (n.ready ? '' : ' · ⏳');
             netWarm = { ready: n.ready, up: n.up };
             updateNetNote();
@@ -2044,6 +2095,7 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             with STATE_LOCK:
                 stats = dict(STATE)
             stats["folder_warn"] = FOLDER_WARN_BYTES
+            stats["interfaces"] = network_ifaces()
             self._json(stats)
         elif url.path == "/api/fileops":
             ops = {o for o in arg("ops", ",".join(DEFAULT_OPS)).split(",") if o in FILEOP_TYPES}
@@ -2091,7 +2143,15 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
         path = urlparse(self.path).path
-        if path == "/api/cd":
+        if path == "/api/interface":
+            iface = body.get("iface", "")
+            if not isinstance(iface, str) or (iface and iface not in network_ifaces()):
+                self._json({"error": "Invalid network interface"}, 400)
+                return
+            with STATE_LOCK:
+                STATE["iface_selected"] = iface or None
+            self._json({"ok": True})
+        elif path == "/api/cd":
             entry = body.get("entry")
             if entry not in load_watched():
                 self._json({"error": "Unknown folder"}, 400)
