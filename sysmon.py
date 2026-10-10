@@ -35,6 +35,8 @@ DEFAULT_WATCHED = [
 WATCHED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watched_folders.json")
 DEFAULT_FOLDER_SCAN_INTERVAL = 300
 FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
+DEFAULT_NETTOP_INTERVAL = 10
+NETTOP_INTERVAL = DEFAULT_NETTOP_INTERVAL
 FOLDER_WARN_BYTES = 5 * 1024**3
 
 FILEOPS_ROOTS = ["/"]
@@ -427,20 +429,32 @@ def read_iface_bytes(iface):
 
 NETTOP = {"seq": 0, "data": {}, "t": 0.0}
 NETTOP_LOCK = threading.Lock()
+NETTOP_PROC = None
+NETTOP_PROC_LOCK = threading.Lock()
+NETTOP_RESTART = threading.Event()
 
 
 def nettop_stream():
+    global NETTOP_PROC
     # nettop needs 20-30 s for its first output after a cold start; one-shot calls with a timeout
     # kept killing it before it answered, so a single long-lived process feeds the samples instead
     while True:
+        NETTOP_RESTART.clear()
+        load_watched()
+        with FOLDERS_LOCK:
+            interval = NETTOP_INTERVAL
         try:
-            proc = subprocess.Popen(["nettop", "-P", "-L", "0", "-s", "2", "-J", "bytes_in,bytes_out", "-x"],
+            proc = subprocess.Popen(["nettop", "-P", "-L", "0", "-s", str(interval), "-J", "bytes_in,bytes_out", "-x"],
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                                     text=True, errors="replace", env=_C_ENV)
         except OSError:
             time.sleep(30)
             continue
+        with NETTOP_PROC_LOCK:
+            NETTOP_PROC = proc
         atexit.register(proc.terminate)
+        if NETTOP_RESTART.is_set():
+            proc.terminate()
         block = {}
         for line in proc.stdout:
             if line.startswith(",bytes_in"):
@@ -453,6 +467,11 @@ def nettop_stream():
             if len(cols) >= 3 and cols[1].isdigit() and cols[2].isdigit():
                 block[cols[0]] = (int(cols[1]), int(cols[2]))
         proc.wait()
+        with NETTOP_PROC_LOCK:
+            if NETTOP_PROC is proc:
+                NETTOP_PROC = None
+        if NETTOP_RESTART.is_set():
+            continue
         time.sleep(5)
 
 
@@ -577,17 +596,19 @@ def _expand(entry):
 def _save_watched(entries):
     tmp = WATCHED_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"folders": entries, "scan_interval_seconds": FOLDER_SCAN_INTERVAL}, f, indent=2)
+        json.dump({"folders": entries, "scan_interval_seconds": FOLDER_SCAN_INTERVAL,
+                   "nettop_interval_seconds": NETTOP_INTERVAL}, f, indent=2)
     os.replace(tmp, WATCHED_FILE)
 
 
 def _load_watched_locked():
-    global FOLDER_SCAN_INTERVAL
+    global FOLDER_SCAN_INTERVAL, NETTOP_INTERVAL
     try:
         with open(WATCHED_FILE, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
+        NETTOP_INTERVAL = DEFAULT_NETTOP_INTERVAL
         _save_watched(DEFAULT_WATCHED)
         return list(DEFAULT_WATCHED)
     except (OSError, ValueError):
@@ -595,6 +616,7 @@ def _load_watched_locked():
 
     if isinstance(data, list) and all(isinstance(entry, str) for entry in data):
         FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
+        NETTOP_INTERVAL = DEFAULT_NETTOP_INTERVAL
         return data
     if isinstance(data, dict):
         entries = data.get("folders")
@@ -602,6 +624,9 @@ def _load_watched_locked():
         if isinstance(entries, list) and all(isinstance(entry, str) for entry in entries):
             FOLDER_SCAN_INTERVAL = (interval if type(interval) is int and 60 <= interval <= 60 * 86400
                                     else DEFAULT_FOLDER_SCAN_INTERVAL)
+            nettop_interval = data.get("nettop_interval_seconds", DEFAULT_NETTOP_INTERVAL)
+            NETTOP_INTERVAL = (nettop_interval if type(nettop_interval) is int and 1 <= nettop_interval <= 3600
+                               else DEFAULT_NETTOP_INTERVAL)
             return entries
     return list(DEFAULT_WATCHED)
 
@@ -1234,6 +1259,14 @@ HTML = """<!doctype html>
             <div class="pop" id="net-pop"></div>
         </div>
         <div class="sec-body">
+            <div class="tools net-settings">
+                <span class="dim">Process traffic sample</span>
+                <select id="nettop-interval-value" aria-label="Network sample interval value"></select>
+                <select id="nettop-interval-unit" aria-label="Network sample interval unit">
+                    <option value="seconds">seconds</option>
+                    <option value="minutes">minutes</option>
+                </select>
+            </div>
             <div class="tools">
                 <input id="net-filter" placeholder="Filter process…">
                 <select id="net-range">
@@ -1693,6 +1726,38 @@ HTML = """<!doctype html>
     }
     const netOpen = new Map();
     let netIfaceOptions = '';
+    const nettopValue = $('nettop-interval-value'), nettopUnit = $('nettop-interval-unit');
+    for (let value = 1; value <= 60; value++) {
+        const option = el('option', '', value);
+        option.value = value;
+        nettopValue.append(option);
+    }
+    nettopValue.value = '10';
+    nettopUnit.value = 'seconds';
+    let nettopSaveTimer = null, nettopDirty = false;
+    function updateNettopInterval(seconds) {
+        if (nettopDirty) return;
+        const inMinutes = seconds % 60 === 0 && seconds / 60 <= 60;
+        nettopValue.value = String(inMinutes ? seconds / 60 : seconds);
+        nettopUnit.value = inMinutes ? 'minutes' : 'seconds';
+    }
+    async function saveNettopInterval() {
+        nettopDirty = true;
+        clearTimeout(nettopSaveTimer);
+        nettopSaveTimer = setTimeout(async () => {
+            nettopSaveTimer = null;
+            try {
+                const result = await postJSON('/api/nettop-interval', {
+                    value: Number(nettopValue.value), unit: nettopUnit.value,
+                });
+                if (result.error) toast(result.error);
+                else toast('Process network sample interval updated');
+            } catch (e) { toast('Could not update process network interval'); }
+            finally { nettopDirty = false; }
+        }, 250);
+    }
+    nettopValue.addEventListener('change', saveNettopInterval);
+    nettopUnit.addEventListener('change', saveNettopInterval);
     $('net-iface').addEventListener('change', async () => {
         try {
             const result = await postJSON('/api/interface', { iface: $('net-iface').value });
@@ -2069,6 +2134,7 @@ HTML = """<!doctype html>
     async function update() {
         let d;
         try { d = await getJSON('/api/stats'); } catch (e) { return; }
+        if (d.nettop_interval_seconds != null) updateNettopInterval(d.nettop_interval_seconds);
         if (!paused.sys) {
             if (d.cpu) {
                 $('cpu-val').textContent = d.cpu.total.toFixed(1) + '%';
@@ -2152,6 +2218,7 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             stats["interfaces"] = network_ifaces()
             with FOLDERS_LOCK:
                 stats["folder_scan_interval_seconds"] = FOLDER_SCAN_INTERVAL
+                stats["nettop_interval_seconds"] = NETTOP_INTERVAL
             self._json(stats)
         elif url.path == "/api/fileops":
             ops = {o for o in arg("ops", ",".join(DEFAULT_OPS)).split(",") if o in FILEOP_TYPES}
@@ -2182,7 +2249,7 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             self._send(HTML, "text/html; charset=utf-8")
 
     def do_POST(self):
-        global FOLDER_SCAN_INTERVAL
+        global FOLDER_SCAN_INTERVAL, NETTOP_INTERVAL
         if not self._host_ok():
             return
         # Custom header forces a CORS preflight (never answered), so other websites cannot POST here
@@ -2200,7 +2267,22 @@ class HTMLHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
         path = urlparse(self.path).path
-        if path == "/api/folder-scan-interval":
+        if path == "/api/nettop-interval":
+            value, unit = body.get("value"), body.get("unit")
+            unit_seconds = {"seconds": 1, "minutes": 60}
+            if type(value) is not int or not 1 <= value <= 60 or not isinstance(unit, str) or unit not in unit_seconds:
+                self._json({"error": "Invalid network sample interval"}, 400)
+                return
+            with FOLDERS_LOCK:
+                entries = _load_watched_locked()
+                NETTOP_INTERVAL = value * unit_seconds[unit]
+                _save_watched(entries)
+            NETTOP_RESTART.set()
+            with NETTOP_PROC_LOCK:
+                if NETTOP_PROC is not None and NETTOP_PROC.poll() is None:
+                    NETTOP_PROC.terminate()
+            self._json({"ok": True, "interval_seconds": NETTOP_INTERVAL})
+        elif path == "/api/folder-scan-interval":
             value, unit = body.get("value"), body.get("unit")
             unit_seconds = {"minutes": 60, "hours": 3600, "days": 86400}
             if type(value) is not int or not 1 <= value <= 60 or not isinstance(unit, str) or unit not in unit_seconds:

@@ -19,5 +19,6 @@
     "~/Library/Developer/Xcode/DerivedData",
     "~/Library/Developer/CoreSimulator/Caches"
   ],
-  "scan_interval_seconds": 300
+  "scan_interval_seconds": 86400,
+  "nettop_interval_seconds": 10
 }

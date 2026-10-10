@@ -9,7 +9,7 @@ A lightweight macOS system monitor that runs as an iTerm2 web panel.
 - CPU, memory, GPU, network, ports, and file activity
 - Process and application usage
 - Configurable disk usage monitoring and scan interval for temporary, cache, and build folders
-Edit `watched_folders.json` or add and remove folders in the panel. Set the scan interval in the panel (1–60 minutes, hours, or days). The defaults avoid scanning nested cache paths twice. The monitor reports folder sizes; it never deletes files. Folders over 5 GB are highlighted.
+- Configurable process-network sampling interval
 - CSV export
 
 ## Install
@@ -23,6 +23,10 @@ No separate Python installation or package setup is required.
 
 ## Watched folders
 
-Edit `watched_folders.json` or add and remove folders in the panel. The monitor reports folder sizes; it never deletes files. Folders over 5 GB are highlighted.
+Edit `watched_folders.json` or add and remove folders in the panel. Set the scan interval to 1–60 minutes, hours, or days. Default paths avoid nested duplicate scans. The monitor never deletes files; folders over 5 GB are highlighted.
+
+## Network sampling
+
+Set process-traffic sampling to 1–60 seconds or minutes in the Network panel. The default is 10 seconds.
 
 File activity works without administrator access. Process names for file activity require an optional `sudoers` rule for `fs_usage`.
