@@ -35,6 +35,8 @@ DEFAULT_WATCHED = [
 WATCHED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watched_folders.json")
 DEFAULT_FOLDER_SCAN_INTERVAL = 300
 FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
+FOLDER_SCAN_AT = None
+FOLDER_SCAN_CACHE = {}
 DEFAULT_NETTOP_INTERVAL = 10
 NETTOP_INTERVAL = DEFAULT_NETTOP_INTERVAL
 FOLDER_WARN_BYTES = 5 * 1024**3
@@ -597,18 +599,20 @@ def _save_watched(entries):
     tmp = WATCHED_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"folders": entries, "scan_interval_seconds": FOLDER_SCAN_INTERVAL,
-                   "nettop_interval_seconds": NETTOP_INTERVAL}, f, indent=2)
+                   "nettop_interval_seconds": NETTOP_INTERVAL, "folder_scan_at": FOLDER_SCAN_AT,
+                   "folder_scan_cache": FOLDER_SCAN_CACHE}, f, indent=2)
     os.replace(tmp, WATCHED_FILE)
 
 
 def _load_watched_locked():
-    global FOLDER_SCAN_INTERVAL, NETTOP_INTERVAL
+    global FOLDER_SCAN_INTERVAL, NETTOP_INTERVAL, FOLDER_SCAN_AT, FOLDER_SCAN_CACHE
     try:
         with open(WATCHED_FILE, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
         NETTOP_INTERVAL = DEFAULT_NETTOP_INTERVAL
+        FOLDER_SCAN_AT, FOLDER_SCAN_CACHE = None, {}
         _save_watched(DEFAULT_WATCHED)
         return list(DEFAULT_WATCHED)
     except (OSError, ValueError):
@@ -617,6 +621,7 @@ def _load_watched_locked():
     if isinstance(data, list) and all(isinstance(entry, str) for entry in data):
         FOLDER_SCAN_INTERVAL = DEFAULT_FOLDER_SCAN_INTERVAL
         NETTOP_INTERVAL = DEFAULT_NETTOP_INTERVAL
+        FOLDER_SCAN_AT, FOLDER_SCAN_CACHE = None, {}
         return data
     if isinstance(data, dict):
         entries = data.get("folders")
@@ -627,6 +632,17 @@ def _load_watched_locked():
             nettop_interval = data.get("nettop_interval_seconds", DEFAULT_NETTOP_INTERVAL)
             NETTOP_INTERVAL = (nettop_interval if type(nettop_interval) is int and 1 <= nettop_interval <= 3600
                                else DEFAULT_NETTOP_INTERVAL)
+            scan_at = data.get("folder_scan_at")
+            FOLDER_SCAN_AT = (scan_at if type(scan_at) in (int, float) and 0 < scan_at < 1e12 else None)
+            cache = data.get("folder_scan_cache", {})
+            FOLDER_SCAN_CACHE = {}
+            if isinstance(cache, dict):
+                for entry, result in cache.items():
+                    if not isinstance(entry, str) or not isinstance(result, dict):
+                        continue
+                    size, missing = result.get("size"), result.get("missing", False)
+                    if (size is None or type(size) is int and size >= 0) and isinstance(missing, bool):
+                        FOLDER_SCAN_CACHE[entry] = {"size": size, "missing": missing}
             return entries
     return list(DEFAULT_WATCHED)
 
@@ -634,6 +650,10 @@ def _load_watched_locked():
 def load_watched():
     with FOLDERS_LOCK:
         return _load_watched_locked()
+
+
+def _folder_scan_due(entries, scanned_at, cache, now):
+    return scanned_at is None or now >= scanned_at + FOLDER_SCAN_INTERVAL or any(entry not in cache for entry in entries)
 
 
 def edit_watched(action, entry):
@@ -673,12 +693,29 @@ def _publish_folders(results, **extra):
 
 
 def folder_scanner():
+    global FOLDER_SCAN_AT, FOLDER_SCAN_CACHE
     while True:
+        requested = RESCAN.is_set()
         RESCAN.clear()
+        entries = load_watched()
+        with FOLDERS_LOCK:
+            scanned_at = FOLDER_SCAN_AT
+            cached = dict(FOLDER_SCAN_CACHE)
+        now = time.time()
+        due = _folder_scan_due(entries, scanned_at, cached, now)
         with STATE_LOCK:
             prev = {f["entry"]: f for f in STATE.get("folders", [])}
-        results = [{"entry": e, "path": _expand(e), "display": e, "missing": False,
-                    "size": prev.get(e, {}).get("size")} for e in load_watched()]
+        results = []
+        for entry in entries:
+            saved = cached.get(entry, {})
+            previous = prev.get(entry, {})
+            results.append({"entry": entry, "path": _expand(entry), "display": entry,
+                            "missing": saved.get("missing", previous.get("missing", False)),
+                            "size": saved.get("size", previous.get("size"))})
+        if not requested and not due:
+            _publish_folders(results, folders_scanning=False, folders_at=scanned_at)
+            RESCAN.wait(max(scanned_at + FOLDER_SCAN_INTERVAL - now, 0))
+            continue
         _publish_folders(results, folders_scanning=True)
         for r in results:
             if RESCAN.is_set():
@@ -692,8 +729,18 @@ def folder_scanner():
                 except (IndexError, ValueError):
                     r["size"] = None
             _publish_folders(results)
-        _publish_folders(results, folders_scanning=False, folders_at=time.time())
-        RESCAN.wait(FOLDER_SCAN_INTERVAL)
+        if RESCAN.is_set():
+            _publish_folders(results, folders_scanning=False, folders_at=scanned_at)
+            continue
+        scanned_at = time.time()
+        cache = {r["entry"]: {"size": r["size"], "missing": r["missing"]} for r in results}
+        with FOLDERS_LOCK:
+            FOLDER_SCAN_AT, FOLDER_SCAN_CACHE = scanned_at, cache
+            try:
+                _save_watched(entries)
+            except OSError:
+                pass
+        _publish_folders(results, folders_scanning=False, folders_at=scanned_at)
 
 
 # --- iTerm2 integration & export ---------------------------------------------

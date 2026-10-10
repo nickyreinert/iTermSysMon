@@ -23,7 +23,7 @@ No separate Python installation or package setup is required.
 
 ## Watched folders
 
-Edit `watched_folders.json` or add and remove folders in the panel. Set the scan interval to 1–60 minutes, hours, or days. Default paths avoid nested duplicate scans. The monitor never deletes files; folders over 5 GB are highlighted.
+Edit `watched_folders.json` or add and remove folders in the panel. Set the scan interval to 1–60 minutes, hours, or days. The last scan time and sizes are saved, so restarting iTerm2 does not trigger an unnecessary scan. Default paths avoid nested duplicate scans. The monitor never deletes files; folders over 5 GB are highlighted.
 
 ## Network sampling
 
