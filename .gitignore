@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.tmp
+watched_folders.json
+sysmon.original.py.txt
