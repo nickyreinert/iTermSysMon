@@ -1,5 +1,7 @@
 # iTermSysMon
 
+![iTermSysMon screenshot](sysmon_screenshot.png)
+
 A lightweight macOS system monitor that runs as an iTerm2 web panel.
 
 ## Features
